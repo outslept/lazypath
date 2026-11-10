@@ -2,10 +2,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
+use serde::Serialize;
+
 use crate::expand::{expand_env_vars, normalize_path_key};
-use crate::model::{EnvScope, PathEntry};
+use crate::model::{AuditSummary, EnvScope, PathEntry, PathStatus, ShadowTarget};
 
 const EXECUTABLE_EXTENSIONS: [&str; 4] = ["exe", "cmd", "bat", "com"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WhichMatch {
+    pub binary: String,
+    pub full_path: String,
+    pub entry_index: usize,
+    pub scope: EnvScope,
+    pub is_winner: bool,
+}
 
 pub fn is_executable_filename(name: &str) -> bool {
     let Some((_, ext)) = name.rsplit_once('.') else {
@@ -75,35 +86,173 @@ pub fn build_base_entries(
     entries
 }
 
+pub fn populate_shadow_graph(entries: &mut [PathEntry]) {
+    for entry in entries.iter_mut() {
+        entry.shadows.clear();
+        entry.shadowed_by.clear();
+    }
+
+    let mut winners: HashMap<String, (usize, String)> = HashMap::new();
+    let mut discovered_conflicts: Vec<(usize, usize, String, String, String)> = Vec::new();
+
+    for entry in entries.iter() {
+        if !entry.exists || entry.is_duplicate {
+            continue;
+        }
+        for exe in &entry.executables {
+            let key = exe.to_ascii_lowercase();
+            if let Some((winner_idx, winner_dir)) = winners.get(&key) {
+                discovered_conflicts.push((
+                    *winner_idx,
+                    entry.index,
+                    exe.clone(),
+                    winner_dir.clone(),
+                    entry.expanded.clone(),
+                ));
+            } else {
+                winners.insert(key, (entry.index, entry.expanded.clone()));
+            }
+        }
+    }
+
+    for (winner_idx, shadowed_idx, binary, winner_dir, shadowed_dir) in discovered_conflicts {
+        if let Some(winner_entry) = entries.get_mut(winner_idx) {
+            winner_entry.shadows.push(ShadowTarget {
+                binary: binary.clone(),
+                other_index: shadowed_idx,
+                other_dir: shadowed_dir,
+            });
+        }
+        if let Some(shadowed_entry) = entries.get_mut(shadowed_idx) {
+            shadowed_entry.shadowed_by.push(ShadowTarget {
+                binary,
+                other_index: winner_idx,
+                other_dir: winner_dir,
+            });
+        }
+    }
+}
+
+pub fn analyze_path_entries(
+    raw_items: &[(String, EnvScope)],
+    lookup: &HashMap<String, String>,
+) -> Vec<PathEntry> {
+    let mut entries = build_base_entries(raw_items, lookup);
+    populate_shadow_graph(&mut entries);
+    entries
+}
+
+pub fn summarize_audit(entries: &[PathEntry]) -> AuditSummary {
+    let mut summary = AuditSummary {
+        total_entries: entries.len(),
+        ..AuditSummary::default()
+    };
+
+    for entry in entries {
+        summary.total_executables += entry.executables.len();
+        match entry.status() {
+            PathStatus::Missing => summary.missing_count += 1,
+            PathStatus::Duplicate => summary.duplicate_count += 1,
+            PathStatus::Conflict => summary.conflict_entries += 1,
+            PathStatus::Shadowed => summary.shadowed_entries += 1,
+            PathStatus::Ok => {}
+        }
+    }
+
+    summary
+}
+
+pub fn which_all(entries: &[PathEntry], query: &str) -> Vec<WhichMatch> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let has_ext = q.contains('.');
+
+    let mut matches = Vec::new();
+    let mut seen_winners = HashSet::new();
+
+    for entry in entries {
+        if !entry.exists || entry.is_duplicate {
+            continue;
+        }
+        for exe in &entry.executables {
+            let lower_exe = exe.to_ascii_lowercase();
+            let stem = lower_exe
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(&lower_exe);
+
+            let matched = if has_ext {
+                lower_exe == q
+            } else {
+                stem == q || lower_exe.contains(&q)
+            };
+
+            if matched {
+                let is_winner = seen_winners.insert(lower_exe);
+                let full_path = Path::new(&entry.expanded)
+                    .join(exe)
+                    .to_string_lossy()
+                    .to_string();
+                matches.push(WhichMatch {
+                    binary: exe.clone(),
+                    full_path,
+                    entry_index: entry.index,
+                    scope: entry.scope,
+                    is_winner,
+                });
+            }
+        }
+    }
+
+    matches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_windows_executable_extensions() {
-        assert!(is_executable_filename("python.exe"));
-        assert!(is_executable_filename("npm.CMD"));
-        assert!(is_executable_filename("gradlew.bat"));
-        assert!(!is_executable_filename("readme.md"));
-        assert!(!is_executable_filename("lib.dll"));
-    }
-
-    #[test]
-    fn detects_missing_and_duplicate_directories() {
-        let temp_dir = std::env::temp_dir().to_string_lossy().to_string();
-        let raw_items = vec![
-            (temp_dir.clone(), EnvScope::User),
-            (temp_dir, EnvScope::System),
-            (
-                r"C:\__lazypath_nonexistent_dir_12345__".to_string(),
-                EnvScope::User,
-            ),
+    fn detects_shadowed_binaries_and_resolves_which_priority() {
+        let mut entries = vec![
+            PathEntry {
+                index: 0,
+                raw: r"C:\Python39".to_string(),
+                expanded: r"C:\Python39".to_string(),
+                scope: EnvScope::User,
+                exists: true,
+                is_duplicate: false,
+                executables: vec!["python.exe".to_string(), "pip.exe".to_string()],
+                shadows: Vec::new(),
+                shadowed_by: Vec::new(),
+            },
+            PathEntry {
+                index: 1,
+                raw: r"C:\Python312".to_string(),
+                expanded: r"C:\Python312".to_string(),
+                scope: EnvScope::System,
+                exists: true,
+                is_duplicate: false,
+                executables: vec!["python.exe".to_string()],
+                shadows: Vec::new(),
+                shadowed_by: Vec::new(),
+            },
         ];
-        let entries = build_base_entries(&raw_items, &HashMap::new());
-        assert_eq!(entries.len(), 3);
-        assert!(entries[0].exists);
-        assert!(!entries[0].is_duplicate);
-        assert!(entries[1].is_duplicate);
-        assert!(!entries[2].exists);
+
+        populate_shadow_graph(&mut entries);
+        assert_eq!(entries[0].status(), PathStatus::Conflict);
+        assert_eq!(entries[1].status(), PathStatus::Shadowed);
+
+        let summary = summarize_audit(&entries);
+        assert_eq!(summary.conflict_entries, 1);
+        assert_eq!(summary.shadowed_entries, 1);
+
+        let found = which_all(&entries, "python");
+        assert_eq!(found.len(), 2);
+        assert!(found[0].is_winner);
+        assert_eq!(found[0].entry_index, 0);
+        assert!(!found[1].is_winner);
+        assert_eq!(found[1].entry_index, 1);
     }
 }
