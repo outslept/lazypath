@@ -6,6 +6,7 @@ description = "Minimalist TUI and CLI Windows PATH and environment variable audi
 license = "MIT"
 
 [dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
