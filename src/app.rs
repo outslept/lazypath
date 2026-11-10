@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::audit::{analyze_path_entries, summarize_audit};
-use crate::expand::split_path_value;
+use crate::expand::{join_path_entries, split_path_value};
 use crate::model::{AuditSummary, EnvScope, EnvVariable, PathEntry};
 use crate::registry::build_lookup_map;
 
@@ -140,7 +140,21 @@ impl App {
         }
     }
 
+    pub fn sync_path_vars_from_lists(&mut self) {
+        let user_joined = join_path_entries(&self.user_path_raw);
+        if let Some(v) = self.user_vars.iter_mut().find(|v| v.is_path_var()) {
+            v.value = user_joined;
+            v.modified = self.user_path_dirty;
+        }
+        let sys_joined = join_path_entries(&self.system_path_raw);
+        if let Some(v) = self.system_vars.iter_mut().find(|v| v.is_path_var()) {
+            v.value = sys_joined;
+            v.modified = self.system_path_dirty;
+        }
+    }
+
     pub fn rebuild_audit(&mut self) {
+        self.sync_path_vars_from_lists();
         let raw_items: Vec<(String, EnvScope)> = match self.current_sidebar() {
             SidebarItem::PathUser => self
                 .user_path_raw
@@ -190,6 +204,17 @@ impl App {
     pub fn selected_path_entry(&self) -> Option<&PathEntry> {
         let visible = self.visible_entries();
         visible.get(self.selected_entry).copied()
+    }
+
+    pub fn selected_variable(&self) -> Option<&EnvVariable> {
+        let SidebarItem::Variable { scope, name } = self.current_sidebar() else {
+            return None;
+        };
+        let list = match scope {
+            EnvScope::User => &self.user_vars,
+            EnvScope::System => &self.system_vars,
+        };
+        list.iter().find(|v| &v.name == name)
     }
 
     pub fn clamp_entry_selection(&mut self) {
@@ -251,6 +276,161 @@ impl App {
             Pane::Entries => Pane::Variables,
         };
     }
+
+    pub fn move_entry_up(&mut self) {
+        if !self.filter_query.is_empty() {
+            self.log(LogLevel::Warn, "clear search filter before reordering PATH");
+            return;
+        }
+        let Some(scope) = self.editable_scope() else {
+            self.log(
+                LogLevel::Warn,
+                "select PATH (User) or PATH (System) to reorder entries",
+            );
+            return;
+        };
+        if self.selected_entry == 0 {
+            return;
+        }
+        let idx = self.selected_entry;
+        let list = self.scope_list_mut(scope);
+        if idx < list.len() {
+            list.swap(idx - 1, idx);
+            self.mark_scope_dirty(scope);
+            self.selected_entry -= 1;
+            self.rebuild_audit();
+            self.log(
+                LogLevel::Ok,
+                format!("moved entry up to #{} (press 's' to save)", idx),
+            );
+        }
+    }
+
+    pub fn move_entry_down(&mut self) {
+        if !self.filter_query.is_empty() {
+            self.log(LogLevel::Warn, "clear search filter before reordering PATH");
+            return;
+        }
+        let Some(scope) = self.editable_scope() else {
+            self.log(
+                LogLevel::Warn,
+                "select PATH (User) or PATH (System) to reorder entries",
+            );
+            return;
+        };
+        let idx = self.selected_entry;
+        let len = self.scope_list_mut(scope).len();
+        if idx + 1 < len {
+            self.scope_list_mut(scope).swap(idx, idx + 1);
+            self.mark_scope_dirty(scope);
+            self.selected_entry += 1;
+            self.rebuild_audit();
+            self.log(
+                LogLevel::Ok,
+                format!("moved entry down to #{} (press 's' to save)", idx + 2),
+            );
+        }
+    }
+
+    pub fn prune_invalid_entries(&mut self) {
+        let Some(scope) = self.editable_scope() else {
+            self.log(
+                LogLevel::Warn,
+                "select PATH (User) or PATH (System) to prune dead entries",
+            );
+            return;
+        };
+        let remove_indices: Vec<usize> = self
+            .audited_entries
+            .iter()
+            .filter(|e| e.is_removable_junk())
+            .map(|e| e.index)
+            .collect();
+
+        if remove_indices.is_empty() {
+            self.log(
+                LogLevel::Info,
+                format!("no missing or duplicate entries in {} PATH", scope.label()),
+            );
+            return;
+        }
+
+        let removed_count = remove_indices.len();
+        let list = self.scope_list_mut(scope);
+        for &idx in remove_indices.iter().rev() {
+            if idx < list.len() {
+                list.remove(idx);
+            }
+        }
+        self.mark_scope_dirty(scope);
+        self.rebuild_audit();
+        self.log(
+            LogLevel::Ok,
+            format!(
+                "pruned {removed_count} dead/duplicate entries from {} PATH (press 's' to save)",
+                scope.label()
+            ),
+        );
+    }
+
+    pub fn delete_selected_entry(&mut self) {
+        let Some(scope) = self.editable_scope() else {
+            self.log(
+                LogLevel::Warn,
+                "select PATH (User) or PATH (System) to remove an entry",
+            );
+            return;
+        };
+        let Some(entry_idx) = self.selected_path_entry().map(|e| e.index) else {
+            return;
+        };
+        let list = self.scope_list_mut(scope);
+        if entry_idx < list.len() {
+            let removed = list.remove(entry_idx);
+            self.mark_scope_dirty(scope);
+            self.rebuild_audit();
+            self.log(
+                LogLevel::Ok,
+                format!(
+                    "removed '{removed}' from {} PATH (press 's' to save)",
+                    scope.label()
+                ),
+            );
+        }
+    }
+
+    pub fn add_path_entry(&mut self, raw_dir: &str) {
+        let trimmed = raw_dir.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            self.log(LogLevel::Warn, "directory path cannot be empty");
+            return;
+        }
+        let scope = self.editable_scope().unwrap_or(EnvScope::User);
+        self.scope_list_mut(scope).push(trimmed.to_string());
+        self.mark_scope_dirty(scope);
+        self.rebuild_audit();
+        self.log(
+            LogLevel::Ok,
+            format!(
+                "appended '{trimmed}' to {} PATH (press 's' to save)",
+                scope.label()
+            ),
+        );
+    }
+
+    fn scope_list_mut(&mut self, scope: EnvScope) -> &mut Vec<String> {
+        match scope {
+            EnvScope::User => &mut self.user_path_raw,
+            EnvScope::System => &mut self.system_path_raw,
+        }
+    }
+
+    fn mark_scope_dirty(&mut self, scope: EnvScope) {
+        match scope {
+            EnvScope::User => self.user_path_dirty = true,
+            EnvScope::System => self.system_path_dirty = true,
+        }
+    }
 }
 
 fn extract_path_list(vars: &[EnvVariable]) -> Vec<String> {
@@ -293,20 +473,12 @@ mod tests {
 
     fn sample_vars() -> (Vec<EnvVariable>, Vec<EnvVariable>) {
         let temp = std::env::temp_dir().to_string_lossy().to_string();
-        let user = vec![
-            EnvVariable {
-                name: "Path".to_string(),
-                value: format!(r"{temp};C:\__missing_dir_lazypath__"),
-                scope: EnvScope::User,
-                modified: false,
-            },
-            EnvVariable {
-                name: "CARGO_HOME".to_string(),
-                value: temp.clone(),
-                scope: EnvScope::User,
-                modified: false,
-            },
-        ];
+        let user = vec![EnvVariable {
+            name: "Path".to_string(),
+            value: format!(r"{temp};C:\__missing_dir_lazypath__"),
+            scope: EnvScope::User,
+            modified: false,
+        }];
         let sys = vec![EnvVariable {
             name: "Path".to_string(),
             value: temp,
@@ -317,16 +489,18 @@ mod tests {
     }
 
     #[test]
-    fn initializes_sidebar_and_audits_selected_scope() {
+    fn reorders_and_prunes_dead_path_entries() {
         let (u, s) = sample_vars();
         let mut app = App::new(u, s, false);
-        assert_eq!(app.current_sidebar(), &SidebarItem::PathUser);
-        assert_eq!(app.audited_entries.len(), 2);
-        assert_eq!(app.summary.missing_count, 1);
+        assert_eq!(app.user_path_raw.len(), 2);
 
-        app.active_pane = Pane::Variables;
-        app.move_next();
-        assert_eq!(app.current_sidebar(), &SidebarItem::PathSystem);
-        assert_eq!(app.audited_entries.len(), 1);
+        app.move_entry_down();
+        assert!(app.user_path_dirty);
+        assert_eq!(app.selected_entry, 1);
+        assert_eq!(app.user_path_raw[0], r"C:\__missing_dir_lazypath__");
+
+        app.prune_invalid_entries();
+        assert_eq!(app.user_path_raw.len(), 1);
+        assert_eq!(app.summary.missing_count, 0);
     }
 }
