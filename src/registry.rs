@@ -96,6 +96,86 @@ pub fn build_lookup_map(
     map
 }
 
+pub fn write_scope_variable(scope: EnvScope, name: &str, value: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("variable name cannot be empty");
+    }
+    let reg_type = if value.contains('%') || name.eq_ignore_ascii_case("PATH") {
+        "REG_EXPAND_SZ"
+    } else {
+        "REG_SZ"
+    };
+
+    let output = silent_command("reg")
+        .args([
+            "add",
+            scope.registry_key(),
+            "/v",
+            name,
+            "/t",
+            reg_type,
+            "/d",
+            value,
+            "/f",
+        ])
+        .output()
+        .with_context(|| format!("failed to execute reg add for {name}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "reg add failed for {} ({}): {}",
+            name,
+            scope.label(),
+            if stderr.is_empty() {
+                "access denied or invalid key"
+            } else {
+                &stderr
+            }
+        );
+    }
+
+    Ok(())
+}
+
+pub fn broadcast_environment_change() {
+    let script = concat!(
+        "Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition '",
+        "[DllImport(\"user32.dll\", SetLastError = true, CharSet = CharSet.Auto)]",
+        "public static extern IntPtr SendMessageTimeout(",
+        "IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, ",
+        "uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'; ",
+        "$r = [UIntPtr]::Zero; ",
+        "[Win32.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment', 2, 2000, [ref]$r) | Out-Null"
+    );
+    let _ = silent_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output();
+}
+
+pub fn is_elevated() -> bool {
+    silent_command("net")
+        .arg("session")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn relaunch_elevated() -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+    let exe_str = exe.to_string_lossy().replace('\'', "''");
+    let script = format!("Start-Process -FilePath '{exe_str}' -Verb RunAs");
+    let status = silent_command("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status()
+        .context("failed to invoke UAC elevation via PowerShell")?;
+
+    if !status.success() {
+        bail!("UAC elevation was canceled or failed");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +193,10 @@ HKEY_CURRENT_USER\\Environment
         assert!(vars[0].is_path_var());
         assert_eq!(vars[1].name, "JAVA_HOME");
         assert_eq!(vars[2].name, "TEMP");
+    }
+
+    #[test]
+    fn rejects_empty_variable_name_on_write() {
+        assert!(write_scope_variable(EnvScope::User, "   ", "value").is_err());
     }
 }
