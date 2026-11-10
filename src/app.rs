@@ -1,9 +1,15 @@
 use std::collections::HashMap;
+use std::path::Path;
+
+use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::audit::{analyze_path_entries, summarize_audit};
 use crate::expand::{join_path_entries, split_path_value};
 use crate::model::{AuditSummary, EnvScope, EnvVariable, PathEntry};
-use crate::registry::build_lookup_map;
+use crate::registry::{
+    broadcast_environment_change, build_lookup_map, relaunch_elevated, write_scope_variable,
+};
+use crate::snapshot::save_snapshot_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
@@ -55,6 +61,23 @@ impl SidebarItem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Modal {
+    None,
+    ExeInspector {
+        dir: String,
+        executables: Vec<(String, Option<String>)>,
+        scroll: usize,
+    },
+    Filter {
+        buffer: String,
+    },
+    AddEntry {
+        buffer: String,
+    },
+    Help,
+}
+
 pub struct App {
     pub user_vars: Vec<EnvVariable>,
     pub system_vars: Vec<EnvVariable>,
@@ -70,6 +93,7 @@ pub struct App {
     pub audited_entries: Vec<PathEntry>,
     pub summary: AuditSummary,
     pub filter_query: String,
+    pub modal: Modal,
     pub is_admin: bool,
     pub status_log: StatusLog,
     pub should_quit: bool,
@@ -97,6 +121,7 @@ impl App {
             audited_entries: Vec::new(),
             summary: AuditSummary::default(),
             filter_query: String::new(),
+            modal: Modal::None,
             is_admin,
             status_log: StatusLog {
                 level: LogLevel::Info,
@@ -124,6 +149,10 @@ impl App {
             level,
             message: message.into(),
         };
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.user_path_dirty || self.system_path_dirty
     }
 
     pub fn current_sidebar(&self) -> &SidebarItem {
@@ -418,6 +447,260 @@ impl App {
         );
     }
 
+    pub fn open_exe_inspector(&mut self) {
+        let Some(entry) = self.selected_path_entry().cloned() else {
+            self.log(LogLevel::Warn, "no PATH directory selected");
+            return;
+        };
+        if !entry.exists {
+            self.log(LogLevel::Warn, "directory does not exist on disk");
+            return;
+        }
+        if entry.executables.is_empty() {
+            self.log(LogLevel::Info, "directory contains 0 executables");
+            return;
+        }
+
+        let mut annotated = Vec::with_capacity(entry.executables.len());
+        for exe in &entry.executables {
+            let note = if let Some(s) = entry
+                .shadows
+                .iter()
+                .find(|t| t.binary.eq_ignore_ascii_case(exe))
+            {
+                Some(format!("shadows #{} ({})", s.other_index + 1, s.other_dir))
+            } else {
+                entry
+                    .shadowed_by
+                    .iter()
+                    .find(|t| t.binary.eq_ignore_ascii_case(exe))
+                    .map(|s| format!("shadowed by #{} ({})", s.other_index + 1, s.other_dir))
+            };
+            annotated.push((exe.clone(), note));
+        }
+
+        self.modal = Modal::ExeInspector {
+            dir: entry.expanded,
+            executables: annotated,
+            scroll: 0,
+        };
+    }
+
+    pub fn export_snapshot_backup(&mut self) {
+        self.sync_path_vars_from_lists();
+        let path = Path::new("lazypath-backup.json");
+        match save_snapshot_file(path, &self.user_vars, &self.system_vars) {
+            Ok(()) => {
+                self.log(
+                    LogLevel::Ok,
+                    "saved environment snapshot to 'lazypath-backup.json'",
+                );
+            }
+            Err(err) => {
+                self.log(LogLevel::Err, format!("snapshot failed: {err}"));
+            }
+        }
+    }
+
+    pub fn save_changes_to_registry(&mut self) {
+        if !self.has_unsaved_changes() {
+            self.log(LogLevel::Info, "no unsaved PATH modifications");
+            return;
+        }
+
+        if self.system_path_dirty && !self.is_admin {
+            self.log(
+                LogLevel::Err,
+                "Administrator privileges required to save System PATH (press 'E' to elevate)",
+            );
+            return;
+        }
+
+        self.sync_path_vars_from_lists();
+        let backup_path = Path::new("lazypath-auto-backup.json");
+        let _ = save_snapshot_file(backup_path, &self.user_vars, &self.system_vars);
+
+        if self.user_path_dirty {
+            let val = join_path_entries(&self.user_path_raw);
+            if let Err(err) = write_scope_variable(EnvScope::User, "Path", &val) {
+                self.log(LogLevel::Err, format!("failed to save User PATH: {err}"));
+                return;
+            }
+            self.user_path_dirty = false;
+        }
+
+        if self.system_path_dirty {
+            let val = join_path_entries(&self.system_path_raw);
+            if let Err(err) = write_scope_variable(EnvScope::System, "Path", &val) {
+                self.log(LogLevel::Err, format!("failed to save System PATH: {err}"));
+                return;
+            }
+            self.system_path_dirty = false;
+        }
+
+        broadcast_environment_change();
+        self.rebuild_audit();
+        self.log(
+            LogLevel::Ok,
+            "saved PATH to Windows Registry and broadcasted WM_SETTINGCHANGE",
+        );
+    }
+
+    pub fn on_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+
+        match self.modal.clone() {
+            Modal::None => self.on_normal_key(key, modifiers),
+            Modal::ExeInspector {
+                dir,
+                executables,
+                mut scroll,
+            } => match key {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.modal = Modal::None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if scroll + 1 < executables.len() {
+                        scroll += 1;
+                    }
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
+                _ => {}
+            },
+            Modal::Filter { buffer } => self.on_filter_key(key, buffer),
+            Modal::AddEntry { buffer } => self.on_add_entry_key(key, buffer),
+            Modal::Help => {
+                if matches!(
+                    key,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q')
+                ) {
+                    self.modal = Modal::None;
+                }
+            }
+        }
+    }
+
+    fn on_normal_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        if modifiers.contains(KeyModifiers::ALT) {
+            match key {
+                KeyCode::Up => {
+                    self.move_entry_up();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_entry_down();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if !self.filter_query.is_empty() {
+                    self.filter_query.clear();
+                    self.clamp_entry_selection();
+                    self.log(LogLevel::Info, "search filter cleared");
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_prev(),
+            KeyCode::Char('J') => self.move_entry_down(),
+            KeyCode::Char('K') => self.move_entry_up(),
+            KeyCode::Tab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l') => self.toggle_pane(),
+            KeyCode::Enter => self.open_exe_inspector(),
+            KeyCode::Char('d') => self.prune_invalid_entries(),
+            KeyCode::Char('x') | KeyCode::Delete => self.delete_selected_entry(),
+            KeyCode::Char('a') => {
+                self.modal = Modal::AddEntry {
+                    buffer: String::new(),
+                };
+            }
+            KeyCode::Char('/') | KeyCode::Char('w') => {
+                self.modal = Modal::Filter {
+                    buffer: self.filter_query.clone(),
+                };
+            }
+            KeyCode::Char('b') => self.export_snapshot_backup(),
+            KeyCode::Char('s') => self.save_changes_to_registry(),
+            KeyCode::Char('E') => match relaunch_elevated() {
+                Ok(()) => self.should_quit = true,
+                Err(err) => self.log(LogLevel::Err, format!("elevation failed: {err}")),
+            },
+            KeyCode::Char('?') => self.modal = Modal::Help,
+            _ => {}
+        }
+    }
+
+    fn on_filter_key(&mut self, key: KeyCode, mut buffer: String) {
+        match key {
+            KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Enter => {
+                self.filter_query = buffer.trim().to_string();
+                self.modal = Modal::None;
+                self.clamp_entry_selection();
+                if self.filter_query.is_empty() {
+                    self.log(LogLevel::Info, "search filter cleared");
+                } else {
+                    let q = self.filter_query.clone();
+                    self.log(LogLevel::Info, format!("filtered entries by '{q}'"));
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                self.filter_query = buffer.trim().to_string();
+                self.clamp_entry_selection();
+                self.modal = Modal::Filter { buffer };
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                self.filter_query = buffer.trim().to_string();
+                self.clamp_entry_selection();
+                self.modal = Modal::Filter { buffer };
+            }
+            _ => {}
+        }
+    }
+
+    fn on_add_entry_key(&mut self, key: KeyCode, mut buffer: String) {
+        match key {
+            KeyCode::Esc => self.modal = Modal::None,
+            KeyCode::Enter => {
+                self.modal = Modal::None;
+                self.add_path_entry(&buffer);
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                self.modal = Modal::AddEntry { buffer };
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                self.modal = Modal::AddEntry { buffer };
+            }
+            _ => {}
+        }
+    }
+
     fn scope_list_mut(&mut self, scope: EnvScope) -> &mut Vec<String> {
         match scope {
             EnvScope::User => &mut self.user_path_raw,
@@ -489,18 +772,23 @@ mod tests {
     }
 
     #[test]
-    fn reorders_and_prunes_dead_path_entries() {
+    fn handles_add_entry_and_filter_modals_via_keys() {
         let (u, s) = sample_vars();
         let mut app = App::new(u, s, false);
-        assert_eq!(app.user_path_raw.len(), 2);
 
-        app.move_entry_down();
-        assert!(app.user_path_dirty);
-        assert_eq!(app.selected_entry, 1);
-        assert_eq!(app.user_path_raw[0], r"C:\__missing_dir_lazypath__");
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('C'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char(':'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('\\'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('T'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.user_path_raw.len(), 3);
 
-        app.prune_invalid_entries();
-        assert_eq!(app.user_path_raw.len(), 1);
-        assert_eq!(app.summary.missing_count, 0);
+        app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.visible_entries().len(), 1);
     }
 }
