@@ -1,3 +1,4 @@
+pub mod app;
 pub mod audit;
 pub mod cli;
 pub mod expand;
