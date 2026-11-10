@@ -1,0 +1,6 @@
+[alias]
+lint = "clippy --all-targets -- -D warnings"
+check-all = "check --all-targets"
+
+[term]
+color = "auto"
