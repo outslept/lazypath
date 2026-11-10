@@ -1,14 +1,28 @@
+use std::io;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use serde::Serialize;
 
+use lazypath::app::App;
 use lazypath::audit::{analyze_path_entries, summarize_audit, which_all};
 use lazypath::cli::{help_text, parse_args, CliOptions};
 use lazypath::expand::split_path_value;
 use lazypath::model::{AuditSummary, EnvScope, EnvVariable, PathEntry};
-use lazypath::registry::{broadcast_environment_change, build_lookup_map, load_all_variables};
+use lazypath::registry::{
+    broadcast_environment_change, build_lookup_map, is_elevated, load_all_variables,
+};
 use lazypath::snapshot::{load_snapshot_file, restore_user_snapshot, save_snapshot_file};
+use lazypath::ui;
 
 #[derive(Serialize)]
 struct JsonAuditReport {
@@ -53,7 +67,51 @@ fn main() -> ExitCode {
         return run_check(&opts);
     }
 
-    run_check(&opts)
+    if let Err(err) = run_tui() {
+        eprintln!("error: {err}");
+        return ExitCode::from(1);
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_tui() -> Result<()> {
+    let (user_vars, sys_vars) = load_all_variables();
+    let admin = is_elevated();
+    let mut app = App::new(user_vars, sys_vars, admin);
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let loop_result = event_loop(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    loop_result
+}
+
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    loop {
+        terminal.draw(|frame| ui::render(frame, app))?;
+
+        if event::poll(Duration::from_millis(80))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    app.on_key(key.code, key.modifiers);
+                }
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn collect_combined_path_entries() -> Vec<PathEntry> {
