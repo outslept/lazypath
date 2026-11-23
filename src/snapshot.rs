@@ -8,19 +8,24 @@ use serde::{Deserialize, Serialize};
 use crate::model::{EnvScope, EnvVariable};
 use crate::registry::write_scope_variable;
 
+/// Point-in-time backup of User and System environment variables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvSnapshot {
+    /// UNIX timestamp (in seconds) when the snapshot was created.
     pub created_unix_secs: u64,
+    /// Captured `HKCU\Environment` variables.
     pub user: Vec<EnvVariable>,
+    /// Captured `HKLM\...\Environment` variables.
     pub system: Vec<EnvVariable>,
 }
 
+/// Creates an in-memory [`EnvSnapshot`] stamped with the current UNIX time.
+#[must_use]
 pub fn create_snapshot(user: &[EnvVariable], system: &[EnvVariable]) -> EnvSnapshot {
     let created_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-
     EnvSnapshot {
         created_unix_secs,
         user: user.to_vec(),
@@ -28,6 +33,11 @@ pub fn create_snapshot(user: &[EnvVariable], system: &[EnvVariable]) -> EnvSnaps
     }
 }
 
+/// Serializes `user` and `system` environment variables to a pretty-printed JSON file at `path`.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails or the file cannot be written to disk.
 pub fn save_snapshot_file(path: &Path, user: &[EnvVariable], system: &[EnvVariable]) -> Result<()> {
     let snapshot = create_snapshot(user, system);
     let json =
@@ -37,6 +47,11 @@ pub fn save_snapshot_file(path: &Path, user: &[EnvVariable], system: &[EnvVariab
     Ok(())
 }
 
+/// Reads and deserializes an [`EnvSnapshot`] from a JSON file at `path`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or contains invalid snapshot JSON.
 pub fn load_snapshot_file(path: &Path) -> Result<EnvSnapshot> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read snapshot file '{}'", path.display()))?;
@@ -45,6 +60,13 @@ pub fn load_snapshot_file(path: &Path) -> Result<EnvSnapshot> {
     Ok(snapshot)
 }
 
+/// Writes all [`EnvScope::User`] variables from `snapshot` back to the Windows Registry.
+///
+/// Returns the number of restored variables.
+///
+/// # Errors
+///
+/// Returns an error if any registry write fails.
 pub fn restore_user_snapshot(snapshot: &EnvSnapshot) -> Result<usize> {
     let mut restored = 0;
     for var in &snapshot.user {
@@ -74,12 +96,10 @@ mod tests {
             scope: EnvScope::System,
             modified: false,
         }];
-
         let temp_file = std::env::temp_dir().join("lazypath_test_snapshot.json");
         save_snapshot_file(&temp_file, &user, &sys).expect("save snapshot");
         let loaded = load_snapshot_file(&temp_file).expect("load snapshot");
         let _ = fs::remove_file(&temp_file);
-
         assert_eq!(loaded.user, user);
         assert_eq!(loaded.system, sys);
     }
