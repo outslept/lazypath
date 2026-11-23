@@ -1,3 +1,5 @@
+//! Terminal UI rendering using `ratatui`.
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,6 +12,10 @@ use ratatui::Frame;
 use crate::app::{App, LogLevel, Modal, Pane, SidebarItem};
 use crate::model::PathStatus;
 
+/// Slate background color used for highlighted list and table rows.
+const HIGHLIGHT_BG_COLOR: Color = Color::Rgb(30, 41, 59);
+
+/// Renders the complete TUI frame (header, split panes, footer, and active modal).
 pub fn render(frame: &mut Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -19,11 +25,9 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(2),
         ])
         .split(frame.area());
-
     render_header(frame, app, root[0]);
     render_body(frame, app, root[1]);
     render_footer(frame, app, root[2]);
-
     match &app.modal {
         Modal::None => {}
         Modal::ExeInspector {
@@ -32,10 +36,10 @@ pub fn render(frame: &mut Frame, app: &App) {
             scroll,
         } => render_exe_modal(frame, dir, executables, *scroll),
         Modal::Filter { buffer } => {
-            render_input_modal(frame, " Filter PATH by Directory or .exe ", buffer)
+            render_input_modal(frame, " Filter PATH by Directory or .exe ", buffer);
         }
         Modal::AddEntry { buffer } => {
-            render_input_modal(frame, " Append Directory to Active PATH ", buffer)
+            render_input_modal(frame, " Append Directory to Active PATH ", buffer);
         }
         Modal::Help => render_help_modal(frame),
     }
@@ -49,7 +53,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::Yellow
     };
-
     let mut spans = vec![
         Span::styled(
             " lazypath ",
@@ -101,7 +104,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
             }),
         ),
     ];
-
     if app.has_unsaved_changes() {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -111,7 +113,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-
     if !app.filter_query.is_empty() {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -125,7 +126,6 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -134,7 +134,6 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
         .split(area);
-
     render_variables_pane(frame, app, chunks[0]);
     render_right_pane(frame, app, chunks[1]);
 }
@@ -146,7 +145,6 @@ fn render_variables_pane(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::DarkGray
     };
-
     let items: Vec<ListItem> = app
         .sidebar_items
         .iter()
@@ -163,23 +161,20 @@ fn render_variables_pane(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
-
     let block = Block::default()
         .title(format!(" Variables ({}) ", app.sidebar_items.len()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
-
     let list = List::new(items)
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(30, 41, 59))
+                .bg(HIGHLIGHT_BG_COLOR)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" > ");
-
     let mut state = ListState::default();
     state.select(Some(app.selected_sidebar));
     frame.render_stateful_widget(list, area, &mut state);
@@ -190,12 +185,10 @@ fn render_right_pane(frame: &mut Frame, app: &App, area: Rect) {
         render_variable_inspector(frame, app, var.name.as_str(), var.value.as_str(), area);
         return;
     }
-
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(3)])
         .split(area);
-
     render_path_table(frame, app, split[0]);
     render_warning_bar(frame, app, split[1]);
 }
@@ -212,7 +205,6 @@ fn render_variable_inspector(frame: &mut Frame, app: &App, name: &str, value: &s
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
-
     let exists_hint = if value.contains('\\') || value.contains('/') {
         if std::path::Path::new(value).exists() {
             "path exists on disk"
@@ -222,13 +214,12 @@ fn render_variable_inspector(frame: &mut Frame, app: &App, name: &str, value: &s
     } else {
         "scalar value"
     };
-
     let lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Name:   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                name.to_string(),
+                name,
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -236,14 +227,13 @@ fn render_variable_inspector(frame: &mut Frame, app: &App, name: &str, value: &s
         ]),
         Line::from(vec![
             Span::styled("  Value:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(value.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(value, Style::default().fg(Color::Cyan)),
         ]),
         Line::from(vec![
             Span::styled("  Check:  ", Style::default().fg(Color::DarkGray)),
             Span::styled(exists_hint, Style::default().fg(Color::Yellow)),
         ]),
     ];
-
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -255,7 +245,6 @@ fn render_path_table(frame: &mut Frame, app: &App, area: Rect) {
         Color::DarkGray
     };
     let visible = app.visible_entries();
-
     let header = Row::new(vec![
         Cell::from("#"),
         Cell::from("DIRECTORY (PRIORITY TOP TO BOTTOM)"),
@@ -267,7 +256,6 @@ fn render_path_table(frame: &mut Frame, app: &App, area: Rect) {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
-
     let rows: Vec<Row> = visible
         .iter()
         .map(|entry| {
@@ -283,49 +271,42 @@ fn render_path_table(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::LightRed)
                     .add_modifier(Modifier::BOLD),
             };
-
             let badge = format!("[{}]", status.badge(entry.executables.len()));
-
             Row::new(vec![
                 Cell::from(format!("{}.", entry.index + 1))
                     .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(entry.expanded.clone()).style(Style::default().fg(Color::White)),
+                Cell::from(entry.expanded.as_str()).style(Style::default().fg(Color::White)),
                 Cell::from(entry.scope.label()).style(Style::default().fg(Color::Gray)),
                 Cell::from(badge).style(status_style),
             ])
         })
         .collect();
-
     let widths = [
         Constraint::Length(4),
         Constraint::Min(32),
         Constraint::Length(8),
         Constraint::Length(16),
     ];
-
     let title = format!(
         " {} Contents ({}) ",
         app.current_sidebar().display_label(),
         visible.len()
     );
-
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
-
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
         .row_highlight_style(
             Style::default()
-                .bg(Color::Rgb(30, 41, 59))
+                .bg(HIGHLIGHT_BG_COLOR)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" > ");
-
     let mut state = TableState::default();
     if !visible.is_empty() {
         state.select(Some(app.selected_entry));
@@ -338,7 +319,6 @@ fn render_warning_bar(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
-
     let line = if let Some(entry) = app.selected_path_entry() {
         if let Some(warning) = entry.headline_warning() {
             Line::from(vec![
@@ -378,7 +358,6 @@ fn render_warning_bar(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))
     };
-
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -387,14 +366,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
-
     let (tag_fg, tag_bg) = match app.status_log.level {
         LogLevel::Ok => (Color::Black, Color::Green),
         LogLevel::Info => (Color::Black, Color::Cyan),
         LogLevel::Warn => (Color::Black, Color::Yellow),
         LogLevel::Err => (Color::White, Color::Red),
     };
-
     let status_line = Line::from(vec![
         Span::styled(
             format!(" {} ", app.status_log.level.tag()),
@@ -406,7 +383,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(&app.status_log.message, Style::default().fg(Color::Gray)),
     ]);
-
     let keys_line = Line::from(vec![
         key_span("j/k"),
         desc_span("nav  "),
@@ -429,7 +405,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         key_span("q"),
         desc_span("quit"),
     ]);
-
     frame.render_widget(Paragraph::new(status_line), rows[0]);
     frame.render_widget(Paragraph::new(keys_line), rows[1]);
 }
@@ -455,20 +430,18 @@ fn render_exe_modal(
 ) {
     let area = centered_rect(68, 18, frame.area());
     frame.render_widget(Clear, area);
-
     let block = Block::default()
         .title(format!(" Executables in {} ({}) ", dir, executables.len()))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
-
     let items: Vec<ListItem> = executables
         .iter()
         .map(|(exe, note)| {
             if let Some(conflict_note) = note {
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("  {:<22} ", exe),
+                        format!("  {exe:<22} "),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -486,17 +459,15 @@ fn render_exe_modal(
             }
         })
         .collect();
-
     let list = List::new(items)
         .block(block)
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(30, 41, 59))
+                .bg(HIGHLIGHT_BG_COLOR)
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" > ");
-
     let mut state = ListState::default();
     state.select(Some(scroll));
     frame.render_stateful_widget(list, area, &mut state);
@@ -505,19 +476,17 @@ fn render_exe_modal(
 fn render_input_modal(frame: &mut Frame, title: &'static str, buffer: &str) {
     let area = centered_rect(60, 5, frame.area());
     frame.render_widget(Clear, area);
-
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
-
     let lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  > ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                buffer.to_string(),
+                buffer,
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -525,20 +494,17 @@ fn render_input_modal(frame: &mut Frame, title: &'static str, buffer: &str) {
             Span::styled("_", Style::default().fg(Color::Cyan)),
         ]),
     ];
-
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_help_modal(frame: &mut Frame) {
     let area = centered_rect(66, 17, frame.area());
     frame.render_widget(Clear, area);
-
     let block = Block::default()
         .title(" Keybindings ")
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan));
-
     let lines = vec![
         Line::from(""),
         help_row("j / k / Up / Down", "Navigate items in active pane"),
@@ -557,7 +523,6 @@ fn render_help_modal(frame: &mut Frame) {
         help_row("q / Ctrl+C", "Exit lazypath"),
         Line::from(""),
     ];
-
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -569,7 +534,7 @@ fn render_help_modal(frame: &mut Frame) {
 fn help_row(keys: &'static str, desc: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("  {:<22}", keys),
+            format!("  {keys:<22}"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
