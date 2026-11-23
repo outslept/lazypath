@@ -1,3 +1,5 @@
+//! Binary entry point for the `lazypath` CLI and TUI.
+
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
@@ -24,14 +26,52 @@ use lazypath::registry::{
 use lazypath::snapshot::{load_snapshot_file, restore_user_snapshot, save_snapshot_file};
 use lazypath::ui;
 
+/// Polling interval for terminal keyboard/resize events.
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Serializable wrapper for `--check --json` output.
 #[derive(Serialize)]
 struct JsonAuditReport {
     summary: AuditSummary,
     entries: Vec<PathEntry>,
 }
 
+/// RAII guard that enables raw mode and the alternate screen on creation
+/// and restores the terminal state on drop.
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        let backend = CrosstermBackend::new(stdout);
+        match Terminal::new(backend) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(err) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                Err(err.into())
+            }
+        }
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args().skip(1);
     let opts = match parse_args(args) {
         Ok(opts) => opts,
         Err(err) => {
@@ -40,38 +80,30 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-
     if opts.show_help {
         println!("{}", help_text());
         return ExitCode::SUCCESS;
     }
-
     if opts.show_version {
         println!("lazypath {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-
     if let Some(export_file) = &opts.export_path {
         return run_export(Path::new(export_file));
     }
-
     if let Some(import_file) = &opts.import_path {
         return run_import(Path::new(import_file));
     }
-
     if let Some(query) = &opts.which_binary {
         return run_which(query, opts.json);
     }
-
     if opts.check || opts.json {
         return run_check(&opts);
     }
-
     if let Err(err) = run_tui() {
         eprintln!("error: {err}");
         return ExitCode::from(1);
     }
-
     ExitCode::SUCCESS
 }
 
@@ -79,34 +111,20 @@ fn run_tui() -> Result<()> {
     let (user_vars, sys_vars) = load_all_variables();
     let admin = is_elevated();
     let mut app = App::new(user_vars, sys_vars, admin);
-
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let loop_result = event_loop(&mut terminal, &mut app);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    loop_result
+    let mut session = TerminalSession::enter()?;
+    event_loop(&mut session.terminal, &mut app)
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::render(frame, app))?;
-
-        if event::poll(Duration::from_millis(80))? {
+        if event::poll(EVENT_POLL_INTERVAL)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     app.on_key(key.code, key.modifiers);
                 }
             }
         }
-
         if app.should_quit {
             break;
         }
@@ -118,10 +136,8 @@ fn collect_combined_path_entries() -> Vec<PathEntry> {
     let (user_vars, sys_vars) = load_all_variables();
     let lookup = build_lookup_map(&user_vars, &sys_vars);
     let mut raw_items: Vec<(String, EnvScope)> = Vec::new();
-
     append_scope_path(&sys_vars, EnvScope::System, &mut raw_items);
     append_scope_path(&user_vars, EnvScope::User, &mut raw_items);
-
     analyze_path_entries(&raw_items, &lookup)
 }
 
@@ -155,7 +171,6 @@ fn run_import(path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     match restore_user_snapshot(&snapshot) {
         Ok(count) => {
             broadcast_environment_change();
@@ -175,7 +190,6 @@ fn run_import(path: &Path) -> ExitCode {
 fn run_which(query: &str, as_json: bool) -> ExitCode {
     let entries = collect_combined_path_entries();
     let matches = which_all(&entries, query);
-
     if as_json {
         if let Ok(json) = serde_json::to_string_pretty(&matches) {
             println!("{json}");
@@ -183,12 +197,10 @@ fn run_which(query: &str, as_json: bool) -> ExitCode {
         }
         return ExitCode::from(1);
     }
-
     if matches.is_empty() {
         eprintln!("warn: no executable matching '{query}' found in PATH");
         return ExitCode::from(1);
     }
-
     println!(
         "{:<10} {:<6} {:<8} {:<18} FULL PATH",
         "STATUS", "ORDER", "SCOPE", "BINARY"
@@ -204,14 +216,12 @@ fn run_which(query: &str, as_json: bool) -> ExitCode {
             m.full_path
         );
     }
-
     ExitCode::SUCCESS
 }
 
 fn run_check(opts: &CliOptions) -> ExitCode {
     let entries = collect_combined_path_entries();
     let summary = summarize_audit(&entries);
-
     if opts.json {
         let report = JsonAuditReport { summary, entries };
         match serde_json::to_string_pretty(&report) {
@@ -225,7 +235,6 @@ fn run_check(opts: &CliOptions) -> ExitCode {
             }
         }
     }
-
     println!(
         "PATH Audit Summary: {} entries | {} missing | {} duplicates | {} conflicts | {} shadowed | {} executables\n",
         summary.total_entries,
@@ -235,7 +244,6 @@ fn run_check(opts: &CliOptions) -> ExitCode {
         summary.shadowed_entries,
         summary.total_executables
     );
-
     println!("{:<5} {:<8} {:<14} DIRECTORY", "#", "SCOPE", "STATUS");
     for entry in &entries {
         let badge = entry.status().badge(entry.executables.len());
@@ -250,6 +258,5 @@ fn run_check(opts: &CliOptions) -> ExitCode {
             println!("      -> warn: {warn}");
         }
     }
-
     ExitCode::SUCCESS
 }
