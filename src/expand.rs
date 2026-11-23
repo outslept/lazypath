@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+/// Expands Windows-style `%VAR%` placeholders using `lookup` (keyed by uppercase name),
+/// falling back to the current process environment. Unresolved placeholders are left intact.
+#[must_use]
 pub fn expand_env_vars(input: &str, lookup: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
+    let mut chars = input.chars();
     while let Some(ch) = chars.next() {
         if ch == '%' {
             let mut token = String::new();
@@ -15,7 +17,6 @@ pub fn expand_env_vars(input: &str, lookup: &HashMap<String, String>) -> String 
                 }
                 token.push(next_ch);
             }
-
             if closed && !token.is_empty() {
                 let key = token.to_ascii_uppercase();
                 if let Some(val) = lookup.get(&key) {
@@ -35,10 +36,14 @@ pub fn expand_env_vars(input: &str, lookup: &HashMap<String, String>) -> String 
             result.push(ch);
         }
     }
-
     result
 }
 
+/// Normalizes a Windows directory path for case-insensitive duplicate detection.
+///
+/// Strips surrounding whitespace and quotes, converts forward slashes to backslashes,
+/// removes trailing backslashes, and lowercases ASCII characters.
+#[must_use]
 pub fn normalize_path_key(path: &str) -> String {
     let replaced = path.trim().trim_matches('"').replace('/', r"\");
     let trimmed = replaced.trim_end_matches('\\');
@@ -49,6 +54,8 @@ pub fn normalize_path_key(path: &str) -> String {
     }
 }
 
+/// Splits a semicolon-delimited `PATH` string into cleaned, non-empty directory entries.
+#[must_use]
 pub fn split_path_value(raw_path: &str) -> Vec<String> {
     raw_path
         .split(';')
@@ -57,6 +64,8 @@ pub fn split_path_value(raw_path: &str) -> Vec<String> {
         .collect()
 }
 
+/// Joins a slice of directory entries into a semicolon-delimited Windows `PATH` string.
+#[must_use]
 pub fn join_path_entries(entries: &[String]) -> String {
     entries
         .iter()
@@ -78,7 +87,6 @@ mod tests {
             "CARGO_HOME".to_string(),
             r"C:\Users\Alice\.cargo".to_string(),
         );
-
         let expanded = expand_env_vars(r"%userprofile%\bin;%CARGO_HOME%\bin;%UNKNOWN%", &map);
         assert_eq!(
             expanded,
