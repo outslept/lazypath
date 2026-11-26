@@ -25,14 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # build.rs uses winresource: MSVC needs rc.exe (Windows SDK, already on
-      # the runner); GNU needs windres.exe + ar.exe from MinGW-w64 in PATH.
       - name: Setup MinGW-w64 (GNU only)
         id: msys2
         if: matrix.target == 'x86_64-pc-windows-gnu'
         uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         with:
           msystem: MINGW64
+          suppress-deprecation-warnings: msystem-mingw64
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
 
       - name: Put MinGW-w64 on PATH (GNU only)
