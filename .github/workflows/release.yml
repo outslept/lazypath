@@ -125,8 +125,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: orthowm-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/orthowm.exe
+          name: lazypath-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/lazypath.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -148,7 +148,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: orthowm-*
+          pattern: lazypath-*
           path: dist/raw
           merge-multiple: false
 
@@ -156,17 +156,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          for d in dist/raw/orthowm-*; do
-            cp "$d/orthowm.exe" "dist/$(basename "$d").exe"
+          for d in dist/raw/lazypath-*; do
+            cp "$d/lazypath.exe" "dist/$(basename "$d").exe"
           done
           cd dist
-          sha256sum orthowm-*.exe > SHA256SUMS.txt
+          sha256sum lazypath-*.exe > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: 'dist/orthowm-*.exe'
+          subject-path: 'dist/lazypath-*.exe'
 
       - name: Attach assets (keeps release-plz's changelog body)
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
@@ -175,6 +175,6 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: |
-            dist/orthowm-*.exe
+            dist/lazypath-*.exe
             dist/SHA256SUMS.txt
             CHANGELOG.md
