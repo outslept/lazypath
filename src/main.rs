@@ -1,24 +1,13 @@
 //! Binary entry point for `lazypath`: dispatches between CLI subcommands
 //! (`--check`, `--which`, `--export`, `--import`) and the interactive `ratatui` TUI.
-
-use std::io::{self, Stdout};
-use std::path::Path;
-use std::process::ExitCode;
-use std::sync::Once;
-use std::time::Duration;
-
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use serde::Serialize;
-
 use lazypath::app::{App, LogLevel};
 use lazypath::audit::{analyze_path_entries, summarize_audit, which_all};
-use lazypath::cli::{CliOptions, help_text, parse_args};
+use lazypath::cli::{help_text, parse_args, CliOptions};
 use lazypath::expand::{normalize_path_key, split_path_value};
 use lazypath::model::{AuditSummary, EnvScope, EnvVariable, PathEntry, PathStatus, SCHEMA_VERSION};
 use lazypath::registry::{
@@ -29,6 +18,14 @@ use lazypath::snapshot::{
     plan_user_snapshot_import, restore_user_snapshot_with_baseline, save_snapshot_file,
 };
 use lazypath::ui::render;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use serde::Serialize;
+use std::io::{self, Stdout};
+use std::path::Path;
+use std::process::ExitCode;
+use std::sync::Once;
+use std::time::Duration;
 
 /// Ensures the terminal-restoring panic hook is registered at most once per process.
 static PANIC_HOOK_ONCE: Once = Once::new();
@@ -69,14 +66,12 @@ impl TerminalSession {
                 prev_hook(panic_info);
             }));
         });
-
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
             return Err(err);
         }
-
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(terminal),
             Err(err) => {
@@ -103,33 +98,26 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-
     if opts.show_help {
         print!("{}", help_text());
         return ExitCode::SUCCESS;
     }
-
     if opts.show_version {
         println!("lazypath {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-
     if let Some(ref export_path) = opts.export_path {
         return run_export(export_path);
     }
-
     if let Some(ref import_path) = opts.import_path {
         return run_import(import_path, &opts);
     }
-
     if let Some(ref binary_query) = opts.which_binary {
         return run_which(binary_query, &opts);
     }
-
     if opts.check {
         return run_check(&opts);
     }
-
     match run_tui(&opts) {
         Ok(code) => code,
         Err(err) => {
@@ -150,7 +138,6 @@ fn run_check(opts: &CliOptions) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     let process_override = if opts.process_path {
         Some(
             std::env::var_os("PATH")
@@ -160,10 +147,8 @@ fn run_check(opts: &CliOptions) -> ExitCode {
     } else {
         None
     };
-
     let entries = collect_combined_path_entries(&user_vars, &sys_vars, process_override.as_deref());
     let summary = summarize_audit(&entries);
-
     if opts.json {
         let report = JsonAuditReport {
             schema_version: SCHEMA_VERSION,
@@ -185,7 +170,6 @@ fn run_check(opts: &CliOptions) -> ExitCode {
     } else {
         print_human_audit_report(&entries, &summary, opts.process_path);
     }
-
     if summary.has_issues() && !opts.no_fail {
         ExitCode::from(1)
     } else {
@@ -210,7 +194,6 @@ fn print_human_audit_report(entries: &[PathEntry], summary: &AuditSummary, proce
         summary.shadowed_entries,
         summary.total_executables
     );
-
     for entry in entries {
         let status = entry.status();
         let badge = status.badge(entry.executables.len());
@@ -221,10 +204,10 @@ fn print_human_audit_report(entries: &[PathEntry], summary: &AuditSummary, proce
             badge,
             entry.expanded
         );
-        if status != PathStatus::Ok
-            && let Some(warning) = entry.headline_warning()
-        {
-            println!("      └─ {warning}");
+        if status != PathStatus::Ok {
+            if let Some(warning) = entry.headline_warning() {
+                println!("      └─ {warning}");
+            }
         }
     }
 }
@@ -239,7 +222,6 @@ fn run_which(query: &str, opts: &CliOptions) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     let process_override = if opts.process_path {
         Some(
             std::env::var_os("PATH")
@@ -249,10 +231,8 @@ fn run_which(query: &str, opts: &CliOptions) -> ExitCode {
     } else {
         None
     };
-
     let entries = collect_combined_path_entries(&user_vars, &sys_vars, process_override.as_deref());
     let matches = which_all(&entries, query);
-
     if opts.json {
         match serde_json::to_string_pretty(&matches) {
             Ok(json) => println!("{json}"),
@@ -267,12 +247,10 @@ fn run_which(query: &str, opts: &CliOptions) -> ExitCode {
             ExitCode::SUCCESS
         };
     }
-
     if matches.is_empty() {
         eprintln!("lazypath: '{query}' not found in any PATH directory.");
         return ExitCode::from(1);
     }
-
     for m in &matches {
         let tag = if m.is_winner { "WINNER  " } else { "SHADOWED" };
         println!(
@@ -282,7 +260,6 @@ fn run_which(query: &str, opts: &CliOptions) -> ExitCode {
             m.full_path
         );
     }
-
     ExitCode::SUCCESS
 }
 
@@ -295,7 +272,6 @@ fn run_export(path_str: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     let path = Path::new(path_str);
     match save_snapshot_file(path, &user_vars, &sys_vars) {
         Ok(()) => {
@@ -331,7 +307,6 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     let (current_user, current_sys) = match load_all_variables() {
         Ok(vars) => vars,
         Err(err) => {
@@ -339,7 +314,6 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     if opts.dry_run {
         let plan = plan_user_snapshot_import(&snapshot, &current_user);
         if opts.json {
@@ -372,7 +346,6 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-
     // Write a mandatory pre-import backup of the current Registry state before mutating HKCU.
     let backup_path = default_auto_backup_path();
     if let Err(err) = save_snapshot_file(&backup_path, &current_user, &current_sys) {
@@ -382,7 +355,6 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
         );
         return ExitCode::from(1);
     }
-
     let summary = match restore_user_snapshot_with_baseline(&snapshot, &current_user) {
         Ok(s) => s,
         Err(err) => {
@@ -393,11 +365,9 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
     if let Err(err) = broadcast_environment_change() {
         eprintln!("lazypath: warning: WM_SETTINGCHANGE broadcast failed: {err}");
     }
-
     if opts.json {
         let report = JsonImportReport {
             schema_version: SCHEMA_VERSION,
@@ -426,7 +396,6 @@ fn run_import(path_str: &str, opts: &CliOptions) -> ExitCode {
             backup_path.display()
         );
     }
-
     ExitCode::SUCCESS
 }
 
@@ -439,9 +408,7 @@ fn run_tui(opts: &CliOptions) -> io::Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     };
-
     let mut app = App::new(user_vars, sys_vars, is_elevated());
-
     if let Some(ref pending_path) = opts.resume_pending_path {
         match load_and_consume_pending_elevation_state(Path::new(pending_path)) {
             Ok(state) => app.apply_pending_elevation(state),
@@ -451,21 +418,18 @@ fn run_tui(opts: &CliOptions) -> io::Result<ExitCode> {
             ),
         }
     }
-
-    let _session = TerminalSession::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-
+    let _session = TerminalSession;
+    let mut terminal = TerminalSession::enter()?;
     while !app.should_quit {
         terminal.draw(|frame| render(frame, &app))?;
-
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key_event) = event::read()?
-            && key_event.kind == KeyEventKind::Press
-        {
-            app.on_key(key_event.code, key_event.modifiers);
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key_event) = event::read()? {
+                if key_event.kind == KeyEventKind::Press {
+                    app.on_key(key_event.code, key_event.modifiers);
+                }
+            }
         }
     }
-
     Ok(ExitCode::SUCCESS)
 }
 
@@ -481,13 +445,11 @@ fn collect_combined_path_entries(
     process_path_override: Option<&str>,
 ) -> Vec<PathEntry> {
     let lookup = build_lookup_map(user_vars, sys_vars);
-
     let sys_raw: Vec<String> = sys_vars
         .iter()
         .find(|v| v.is_path_var())
         .map(|v| split_path_value(&v.value))
         .unwrap_or_default();
-
     let raw_items: Vec<(String, EnvScope)> = if let Some(proc_path) = process_path_override {
         let sys_keys: std::collections::HashSet<String> =
             sys_raw.iter().map(|s| normalize_path_key(s)).collect();
@@ -508,13 +470,11 @@ fn collect_combined_path_entries(
             .find(|v| v.is_path_var())
             .map(|v| split_path_value(&v.value))
             .unwrap_or_default();
-
         let mut combined = Vec::with_capacity(sys_raw.len() + user_raw.len());
         combined.extend(sys_raw.into_iter().map(|p| (p, EnvScope::System)));
         combined.extend(user_raw.into_iter().map(|p| (p, EnvScope::User)));
         combined
     };
-
     analyze_path_entries(&raw_items, &lookup)
 }
 
@@ -538,7 +498,6 @@ mod tests {
             EnvScope::System,
             RegValueKind::ExpandSz,
         )];
-
         let reg_entries = collect_combined_path_entries(&user_vars, &sys_vars, None);
         assert_eq!(reg_entries.len(), 2);
         assert_eq!(reg_entries[0].scope, EnvScope::System);
@@ -547,8 +506,11 @@ mod tests {
         assert!(!reg_entries[1].exists);
 
         let custom_proc_path = format!(r"{temp_dir};C:\__lazypath_proc_only__");
-        let proc_entries =
-            collect_combined_path_entries(&user_vars, &sys_vars, Some(&custom_path_ref(&custom_proc_path)));
+        let proc_entries = collect_combined_path_entries(
+            &user_vars,
+            &sys_vars,
+            Some(&custom_path_ref(&custom_proc_path)),
+        );
         assert_eq!(proc_entries.len(), 2);
         assert_eq!(proc_entries[0].scope, EnvScope::System);
         assert_eq!(proc_entries[1].scope, EnvScope::User);
