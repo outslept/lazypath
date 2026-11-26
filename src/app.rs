@@ -1,23 +1,24 @@
 //! Interactive TUI application state, keybinding dispatch, and `PATH` editing actions.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::audit::{analyze_path_entries, summarize_audit};
+use crate::audit::{analyze_path_entries_cached, summarize_audit, DirScanCache};
 use crate::expand::{join_path_entries, split_path_value};
-use crate::model::{AuditSummary, EnvScope, EnvVariable, PathEntry};
+use crate::model::{AuditSummary, EnvScope, EnvVariable, PathEntry, RegValueKind, SCHEMA_VERSION};
 use crate::registry::{
-    broadcast_environment_change, build_lookup_map, relaunch_elevated, write_scope_variable,
+    broadcast_environment_change, build_lookup_map, delete_scope_variable, relaunch_elevated,
+    relaunch_elevated_with_args, write_scope_variable_with_kind,
 };
-use crate::snapshot::save_snapshot_file;
+use crate::snapshot::{
+    default_auto_backup_path, default_manual_backup_path, default_pending_elevation_path,
+    save_pending_elevation_state, save_snapshot_file, PendingElevationState,
+};
 
-/// Default filename used when the user triggers a manual backup (`b`).
-const MANUAL_BACKUP_FILENAME: &str = "lazypath-backup.json";
-
-/// Filename written automatically before applying registry modifications (`s`).
-const AUTO_BACKUP_FILENAME: &str = "lazypath-auto-backup.json";
+/// Number of rows jumped when pressing `PageUp` or `PageDown`.
+const PAGE_SCROLL_STEP: usize = 10;
 
 /// Which split pane currently holds keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +93,12 @@ impl SidebarItem {
             Self::Variable { scope, name } => format!("{name} ({})", scope.label()),
         }
     }
+
+    /// Returns `true` if this sidebar item represents a non-`PATH` environment variable.
+    #[must_use]
+    pub const fn is_variable(&self) -> bool {
+        matches!(self, Self::Variable { .. })
+    }
 }
 
 /// Active modal overlay dialog, if any.
@@ -113,22 +120,30 @@ pub enum Modal {
     Filter {
         /// Current text input buffer.
         buffer: String,
+        /// Previous committed query restored if the user cancels with `Esc`.
+        original_query: String,
     },
     /// Dialog for appending a new directory to the active `PATH`.
     AddEntry {
         /// Current text input buffer.
         buffer: String,
     },
+    /// Confirmation dialog shown when pressing `q` with unsaved `PATH` edits.
+    ConfirmQuit,
     /// Keybindings help popup.
     Help,
 }
 
 /// Complete state of the `lazypath` TUI application.
 pub struct App {
-    /// Loaded User environment variables.
+    /// Loaded User environment variables (updated in-memory as `PATH` edits occur).
     pub user_vars: Vec<EnvVariable>,
-    /// Loaded System environment variables.
+    /// Loaded System environment variables (updated in-memory as `PATH` edits occur).
     pub system_vars: Vec<EnvVariable>,
+    /// Last persisted User environment variables in the Registry (used for pre-save backups and rollback).
+    pub saved_user_vars: Vec<EnvVariable>,
+    /// Last persisted System environment variables in the Registry (used for pre-save backups and rollback).
+    pub saved_system_vars: Vec<EnvVariable>,
     /// Merged uppercase environment lookup map for `%VAR%` expansion.
     pub lookup: HashMap<String, String>,
     /// Editable list of raw User `PATH` directories.
@@ -151,6 +166,8 @@ pub struct App {
     pub audited_entries: Vec<PathEntry>,
     /// Summary metrics for `audited_entries`.
     pub summary: AuditSummary,
+    /// Cache of directory executable scans to keep UI navigation non-blocking.
+    pub scan_cache: DirScanCache,
     /// Active case-insensitive search query.
     pub filter_query: String,
     /// Active modal dialog state.
@@ -171,9 +188,14 @@ impl App {
         let user_path_raw = extract_path_list(&user_vars);
         let system_path_raw = extract_path_list(&system_vars);
         let sidebar_items = build_sidebar_items(&user_vars, &system_vars);
+        let saved_user_vars = user_vars.clone();
+        let saved_system_vars = system_vars.clone();
+
         let mut app = Self {
             user_vars,
             system_vars,
+            saved_user_vars,
+            saved_system_vars,
             lookup,
             user_path_raw,
             system_path_raw,
@@ -185,6 +207,7 @@ impl App {
             active_pane: Pane::Entries,
             audited_entries: Vec::new(),
             summary: AuditSummary::default(),
+            scan_cache: DirScanCache::new(),
             filter_query: String::new(),
             modal: Modal::None,
             is_admin,
@@ -207,6 +230,23 @@ impl App {
             ),
         );
         app
+    }
+
+    /// Restores unsaved edits handed off from an unprivileged session via `--resume-pending`.
+    pub fn apply_pending_elevation(&mut self, state: PendingElevationState) {
+        self.user_path_raw = state.user_path_raw;
+        self.system_path_raw = state.system_path_raw;
+        self.user_path_dirty = state.user_path_dirty;
+        self.system_path_dirty = state.system_path_dirty;
+        if state.selected_sidebar < self.sidebar_items.len() {
+            self.selected_sidebar = state.selected_sidebar;
+        }
+        self.selected_entry = state.selected_entry;
+        self.rebuild_audit();
+        self.log(
+            LogLevel::Ok,
+            "restored unsaved PATH edits in elevated Administrator session (press 's' to save)",
+        );
     }
 
     /// Updates the footer status bar with a new message.
@@ -241,22 +281,48 @@ impl App {
         }
     }
 
+    /// Returns the target [`EnvScope`] used when appending a new directory (`a`),
+    /// defaulting to [`EnvScope::User`] when viewing `PATH (Combined)` or a variable.
+    #[must_use]
+    pub fn target_add_scope(&self) -> EnvScope {
+        self.editable_scope().unwrap_or(EnvScope::User)
+    }
+
     /// Synchronizes the joined `Path` variable strings inside `user_vars` and `system_vars`
-    /// from `user_path_raw` and `system_path_raw`.
+    /// from `user_path_raw` and `system_path_raw`, creating the variable record if it did not
+    /// initially exist, and refreshes `lookup`.
     pub fn sync_path_vars_from_lists(&mut self) {
         let user_joined = join_path_entries(&self.user_path_raw);
         if let Some(v) = self.user_vars.iter_mut().find(|v| v.is_path_var()) {
             v.value = user_joined;
             v.modified = self.user_path_dirty;
+        } else if !user_joined.is_empty() || self.user_path_dirty {
+            let mut var =
+                EnvVariable::with_kind("Path", user_joined, EnvScope::User, RegValueKind::ExpandSz);
+            var.modified = self.user_path_dirty;
+            self.user_vars.insert(0, var);
         }
+
         let sys_joined = join_path_entries(&self.system_path_raw);
         if let Some(v) = self.system_vars.iter_mut().find(|v| v.is_path_var()) {
             v.value = sys_joined;
             v.modified = self.system_path_dirty;
+        } else if !sys_joined.is_empty() || self.system_path_dirty {
+            let mut var = EnvVariable::with_kind(
+                "Path",
+                sys_joined,
+                EnvScope::System,
+                RegValueKind::ExpandSz,
+            );
+            var.modified = self.system_path_dirty;
+            self.system_vars.insert(0, var);
         }
+
+        self.lookup = build_lookup_map(&self.user_vars, &self.system_vars);
     }
 
-    /// Recomputes `audited_entries` and `summary` for the currently active sidebar view.
+    /// Recomputes `audited_entries` and `summary` for the currently active sidebar view
+    /// using cached directory scans.
     pub fn rebuild_audit(&mut self) {
         self.sync_path_vars_from_lists();
         let raw_items: Vec<(String, EnvScope)> = match self.current_sidebar() {
@@ -286,13 +352,29 @@ impl App {
                 combined
             }
         };
-        self.audited_entries = analyze_path_entries(&raw_items, &self.lookup);
+        self.audited_entries =
+            analyze_path_entries_cached(&raw_items, &self.lookup, &mut self.scan_cache);
         self.summary = summarize_audit(&self.audited_entries);
         self.clamp_entry_selection();
     }
 
-    /// Returns audited `PATH` entries matching the active `filter_query` without
-    /// allocating temporary lowercased strings.
+    /// Clears the directory scan cache and performs a fresh disk audit (`r`).
+    pub fn refresh_audit(&mut self) {
+        self.scan_cache.clear();
+        self.rebuild_audit();
+        self.log(
+            LogLevel::Ok,
+            format!(
+                "rescanned {} PATH directories from disk ({} missing, {} dup, {} conflicts)",
+                self.summary.total_entries,
+                self.summary.missing_count,
+                self.summary.duplicate_count,
+                self.summary.conflict_entries
+            ),
+        );
+    }
+
+    /// Returns audited `PATH` entries matching the active `filter_query`.
     #[must_use]
     pub fn visible_entries(&self) -> Vec<&PathEntry> {
         let q = self.filter_query.trim();
@@ -302,11 +384,11 @@ impl App {
         self.audited_entries
             .iter()
             .filter(|e| {
-                contains_ascii_case_insensitive(&e.expanded, q)
-                    || contains_ascii_case_insensitive(&e.raw, q)
+                contains_case_insensitive(&e.expanded, q)
+                    || contains_case_insensitive(&e.raw, q)
                     || e.executables
                         .iter()
-                        .any(|exe| contains_ascii_case_insensitive(exe, q))
+                        .any(|exe| contains_case_insensitive(exe, q))
             })
             .collect()
     }
@@ -347,9 +429,12 @@ impl App {
         match self.active_pane {
             Pane::Variables => {
                 if !self.sidebar_items.is_empty() {
+                    let prev_was_var = self.current_sidebar().is_variable();
                     self.selected_sidebar = (self.selected_sidebar + 1) % self.sidebar_items.len();
                     self.selected_entry = 0;
-                    self.rebuild_audit();
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
                 }
             }
             Pane::Entries => {
@@ -366,13 +451,16 @@ impl App {
         match self.active_pane {
             Pane::Variables => {
                 if !self.sidebar_items.is_empty() {
+                    let prev_was_var = self.current_sidebar().is_variable();
                     self.selected_sidebar = if self.selected_sidebar == 0 {
                         self.sidebar_items.len() - 1
                     } else {
                         self.selected_sidebar - 1
                     };
                     self.selected_entry = 0;
-                    self.rebuild_audit();
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
                 }
             }
             Pane::Entries => {
@@ -384,6 +472,89 @@ impl App {
                         self.selected_entry - 1
                     };
                 }
+            }
+        }
+    }
+
+    /// Jumps to the first item in the currently active pane (`Home`).
+    pub fn move_first(&mut self) {
+        match self.active_pane {
+            Pane::Variables => {
+                if !self.sidebar_items.is_empty() && self.selected_sidebar != 0 {
+                    let prev_was_var = self.current_sidebar().is_variable();
+                    self.selected_sidebar = 0;
+                    self.selected_entry = 0;
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
+                }
+            }
+            Pane::Entries => {
+                self.selected_entry = 0;
+            }
+        }
+    }
+
+    /// Jumps to the last item in the currently active pane (`End`).
+    pub fn move_last(&mut self) {
+        match self.active_pane {
+            Pane::Variables => {
+                if !self.sidebar_items.is_empty() {
+                    let prev_was_var = self.current_sidebar().is_variable();
+                    self.selected_sidebar = self.sidebar_items.len() - 1;
+                    self.selected_entry = 0;
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
+                }
+            }
+            Pane::Entries => {
+                let len = self.visible_entries().len();
+                if len > 0 {
+                    self.selected_entry = len - 1;
+                }
+            }
+        }
+    }
+
+    /// Moves selection down by [`PAGE_SCROLL_STEP`] in the currently active pane (`PageDown`).
+    pub fn move_page_down(&mut self) {
+        match self.active_pane {
+            Pane::Variables => {
+                if !self.sidebar_items.is_empty() {
+                    let prev_was_var = self.current_sidebar().is_variable();
+                    self.selected_sidebar = (self.selected_sidebar + PAGE_SCROLL_STEP)
+                        .min(self.sidebar_items.len() - 1);
+                    self.selected_entry = 0;
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
+                }
+            }
+            Pane::Entries => {
+                let len = self.visible_entries().len();
+                if len > 0 {
+                    self.selected_entry = (self.selected_entry + PAGE_SCROLL_STEP).min(len - 1);
+                }
+            }
+        }
+    }
+
+    /// Moves selection up by [`PAGE_SCROLL_STEP`] in the currently active pane (`PageUp`).
+    pub fn move_page_up(&mut self) {
+        match self.active_pane {
+            Pane::Variables => {
+                if !self.sidebar_items.is_empty() {
+                    let prev_was_var = self.current_sidebar().is_variable();
+                    self.selected_sidebar = self.selected_sidebar.saturating_sub(PAGE_SCROLL_STEP);
+                    self.selected_entry = 0;
+                    if !prev_was_var || !self.current_sidebar().is_variable() {
+                        self.rebuild_audit();
+                    }
+                }
+            }
+            Pane::Entries => {
+                self.selected_entry = self.selected_entry.saturating_sub(PAGE_SCROLL_STEP);
             }
         }
     }
@@ -455,6 +626,13 @@ impl App {
 
     /// Removes all missing and duplicate entries from the currently selected editable `PATH`.
     pub fn prune_invalid_entries(&mut self) {
+        if !self.filter_query.is_empty() {
+            self.log(
+                LogLevel::Warn,
+                "clear search filter before pruning dead entries",
+            );
+            return;
+        }
         let Some(scope) = self.editable_scope() else {
             self.log(
                 LogLevel::Warn,
@@ -520,24 +698,39 @@ impl App {
         }
     }
 
-    /// Appends a new directory entry to the active editable `PATH` (defaulting to User `PATH`).
+    /// Appends one or more directory entries to the active editable `PATH` (defaulting to User `PATH`).
+    ///
+    /// Automatically splits semicolon-delimited input (respecting quoted semicolons) so pasting
+    /// multiple directories does not create a single malformed entry.
     pub fn add_path_entry(&mut self, raw_dir: &str) {
-        let trimmed = raw_dir.trim().trim_matches('"');
-        if trimmed.is_empty() {
+        let parts = split_path_value(raw_dir);
+        if parts.is_empty() {
             self.log(LogLevel::Warn, "directory path cannot be empty");
             return;
         }
-        let scope = self.editable_scope().unwrap_or(EnvScope::User);
-        self.scope_list_mut(scope).push(trimmed.to_string());
+        let scope = self.target_add_scope();
+        let count = parts.len();
+        let first = parts[0].clone();
+        self.scope_list_mut(scope).extend(parts);
         self.mark_scope_dirty(scope);
         self.rebuild_audit();
-        self.log(
-            LogLevel::Ok,
-            format!(
-                "appended '{trimmed}' to {} PATH (press 's' to save)",
-                scope.label()
-            ),
-        );
+        if count == 1 {
+            self.log(
+                LogLevel::Ok,
+                format!(
+                    "appended '{first}' to {} PATH (press 's' to save)",
+                    scope.label()
+                ),
+            );
+        } else {
+            self.log(
+                LogLevel::Ok,
+                format!(
+                    "appended {count} directories to {} PATH (press 's' to save)",
+                    scope.label()
+                ),
+            );
+        }
     }
 
     /// Opens the executable inspector modal for the currently selected `PATH` directory.
@@ -579,15 +772,16 @@ impl App {
         };
     }
 
-    /// Exports a JSON snapshot of User and System environment variables to `lazypath-backup.json`.
+    /// Exports a JSON snapshot of User and System environment variables to
+    /// `%LOCALAPPDATA%\lazypath\lazypath-backup.json`.
     pub fn export_snapshot_backup(&mut self) {
         self.sync_path_vars_from_lists();
-        let path = Path::new(MANUAL_BACKUP_FILENAME);
-        match save_snapshot_file(path, &self.user_vars, &self.system_vars) {
+        let path = default_manual_backup_path();
+        match save_snapshot_file(&path, &self.user_vars, &self.system_vars) {
             Ok(()) => {
                 self.log(
                     LogLevel::Ok,
-                    format!("saved environment snapshot to '{MANUAL_BACKUP_FILENAME}'"),
+                    format!("saved environment snapshot to '{}'", path.display()),
                 );
             }
             Err(err) => {
@@ -597,7 +791,9 @@ impl App {
     }
 
     /// Persists modified User and/or System `PATH` lists to the Windows Registry
-    /// and broadcasts `WM_SETTINGCHANGE`.
+    /// after writing a mandatory pre-save backup of the prior Registry state, rolling
+    /// back User `PATH` if a subsequent System `PATH` write fails, and broadcasting
+    /// `WM_SETTINGCHANGE`.
     pub fn save_changes_to_registry(&mut self) {
         if !self.has_unsaved_changes() {
             self.log(LogLevel::Info, "no unsaved PATH modifications");
@@ -606,35 +802,167 @@ impl App {
         if self.system_path_dirty && !self.is_admin {
             self.log(
                 LogLevel::Err,
-                "Administrator privileges required to save System PATH (press 'E' to elevate)",
+                "Administrator privileges required to save System PATH (press 'E' to elevate with edits)",
             );
             return;
         }
-        self.sync_path_vars_from_lists();
-        let backup_path = Path::new(AUTO_BACKUP_FILENAME);
-        let _ = save_snapshot_file(backup_path, &self.user_vars, &self.system_vars);
+
+        // 1. Write mandatory pre-save backup of the LAST PERSISTED registry state before mutating.
+        let backup_path = default_auto_backup_path();
+        if let Err(err) =
+            save_snapshot_file(&backup_path, &self.saved_user_vars, &self.saved_system_vars)
+        {
+            self.log(
+                LogLevel::Err,
+                format!(
+                    "aborted save: failed to create pre-save backup at '{}': {err}",
+                    backup_path.display()
+                ),
+            );
+            return;
+        }
+
+        let prev_user_path = self
+            .saved_user_vars
+            .iter()
+            .find(|v| v.is_path_var())
+            .cloned();
+
+        let mut wrote_user = false;
         if self.user_path_dirty {
             let val = join_path_entries(&self.user_path_raw);
-            if let Err(err) = write_scope_variable(EnvScope::User, "Path", &val) {
+            if let Err(err) =
+                write_scope_variable_with_kind(EnvScope::User, "Path", &val, RegValueKind::ExpandSz)
+            {
                 self.log(LogLevel::Err, format!("failed to save User PATH: {err}"));
                 return;
             }
-            self.user_path_dirty = false;
+            wrote_user = true;
         }
+
         if self.system_path_dirty {
             let val = join_path_entries(&self.system_path_raw);
-            if let Err(err) = write_scope_variable(EnvScope::System, "Path", &val) {
-                self.log(LogLevel::Err, format!("failed to save System PATH: {err}"));
+            if let Err(err) = write_scope_variable_with_kind(
+                EnvScope::System,
+                "Path",
+                &val,
+                RegValueKind::ExpandSz,
+            ) {
+                if wrote_user {
+                    let rb_res = match &prev_user_path {
+                        Some(old_var) => write_scope_variable_with_kind(
+                            EnvScope::User,
+                            &old_var.name,
+                            &old_var.value,
+                            old_var.effective_kind(),
+                        ),
+                        None => delete_scope_variable(EnvScope::User, "Path"),
+                    };
+                    match rb_res {
+                        Ok(()) => {
+                            self.log(
+                                LogLevel::Err,
+                                format!(
+                                    "failed to save System PATH: {err} (User PATH rolled back cleanly)"
+                                ),
+                            );
+                        }
+                        Err(rb_err) => {
+                            self.log(
+                                LogLevel::Err,
+                                format!(
+                                    "failed to save System PATH: {err} (User PATH rollback also failed: {rb_err}; backup at '{}')",
+                                    backup_path.display()
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    self.log(LogLevel::Err, format!("failed to save System PATH: {err}"));
+                }
                 return;
             }
-            self.system_path_dirty = false;
         }
-        broadcast_environment_change();
+
+        self.user_path_dirty = false;
+        self.system_path_dirty = false;
+        self.sync_path_vars_from_lists();
+        self.saved_user_vars = self.user_vars.clone();
+        self.saved_system_vars = self.system_vars.clone();
         self.rebuild_audit();
-        self.log(
-            LogLevel::Ok,
-            "saved PATH to Windows Registry and broadcasted WM_SETTINGCHANGE",
-        );
+
+        match broadcast_environment_change() {
+            Ok(()) => {
+                self.log(
+                    LogLevel::Ok,
+                    "saved PATH to Windows Registry and broadcasted WM_SETTINGCHANGE",
+                );
+            }
+            Err(err) => {
+                self.log(
+                    LogLevel::Warn,
+                    format!("saved PATH to Registry, but WM_SETTINGCHANGE broadcast failed: {err}"),
+                );
+            }
+        }
+    }
+
+    /// Relaunches `lazypath` with UAC Administrator privileges (`E`), serializing and forwarding
+    /// any unsaved `PATH` edits so they are preserved in the elevated session.
+    pub fn elevate_session(&mut self) {
+        if self.is_admin {
+            self.log(
+                LogLevel::Info,
+                "already running with Administrator privileges",
+            );
+            return;
+        }
+
+        if !self.has_unsaved_changes() {
+            match relaunch_elevated() {
+                Ok(()) => self.should_quit = true,
+                Err(err) => self.log(LogLevel::Err, format!("elevation failed: {err}")),
+            }
+            return;
+        }
+
+        let pending_path = default_pending_elevation_path();
+        let created_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let state = PendingElevationState {
+            schema_version: SCHEMA_VERSION,
+            created_unix_secs,
+            user_path_raw: self.user_path_raw.clone(),
+            system_path_raw: self.system_path_raw.clone(),
+            user_path_dirty: self.user_path_dirty,
+            system_path_dirty: self.system_path_dirty,
+            selected_sidebar: self.selected_sidebar,
+            selected_entry: self.selected_entry,
+        };
+
+        if let Err(err) = save_pending_elevation_state(&pending_path, &state) {
+            self.log(
+                LogLevel::Err,
+                format!("cannot elevate: failed to save pending edits: {err}"),
+            );
+            return;
+        }
+
+        let args = vec![
+            "--resume-pending".to_string(),
+            pending_path.to_string_lossy().into_owned(),
+        ];
+        match relaunch_elevated_with_args(&args) {
+            Ok(()) => {
+                self.should_quit = true;
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&pending_path);
+                self.log(LogLevel::Err, format!("elevation failed: {err}"));
+            }
+        }
     }
 
     /// Handles a single keyboard press event in either normal mode or the active modal.
@@ -669,6 +997,42 @@ impl App {
                         scroll,
                     };
                 }
+                KeyCode::PageDown => {
+                    if !executables.is_empty() {
+                        scroll = (scroll + PAGE_SCROLL_STEP).min(executables.len() - 1);
+                    }
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(PAGE_SCROLL_STEP);
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
+                KeyCode::Home => {
+                    scroll = 0;
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
+                KeyCode::End => {
+                    if !executables.is_empty() {
+                        scroll = executables.len() - 1;
+                    }
+                    self.modal = Modal::ExeInspector {
+                        dir,
+                        executables,
+                        scroll,
+                    };
+                }
                 _ => {
                     self.modal = Modal::ExeInspector {
                         dir,
@@ -677,8 +1041,28 @@ impl App {
                     };
                 }
             },
-            Modal::Filter { buffer } => self.on_filter_key(key, buffer),
+            Modal::Filter {
+                buffer,
+                original_query,
+            } => self.on_filter_key(key, buffer, original_query),
             Modal::AddEntry { buffer } => self.on_add_entry_key(key, buffer),
+            Modal::ConfirmQuit => match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.should_quit = true;
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.save_changes_to_registry();
+                    if !self.has_unsaved_changes() {
+                        self.should_quit = true;
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.log(LogLevel::Info, "quit canceled; unsaved edits preserved");
+                }
+                _ => {
+                    self.modal = Modal::ConfirmQuit;
+                }
+            },
             Modal::Help => {
                 if !matches!(
                     key,
@@ -705,7 +1089,13 @@ impl App {
             }
         }
         match key {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                if self.has_unsaved_changes() {
+                    self.modal = Modal::ConfirmQuit;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Esc => {
                 if !self.filter_query.is_empty() {
                     self.filter_query.clear();
@@ -715,6 +1105,10 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_next(),
             KeyCode::Up | KeyCode::Char('k') => self.move_prev(),
+            KeyCode::Home => self.move_first(),
+            KeyCode::End => self.move_last(),
+            KeyCode::PageDown => self.move_page_down(),
+            KeyCode::PageUp => self.move_page_up(),
             KeyCode::Char('J') => self.move_entry_down(),
             KeyCode::Char('K') => self.move_entry_up(),
             KeyCode::Tab
@@ -733,22 +1127,25 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char('w') => {
                 self.modal = Modal::Filter {
                     buffer: self.filter_query.clone(),
+                    original_query: self.filter_query.clone(),
                 };
             }
+            KeyCode::Char('r') => self.refresh_audit(),
             KeyCode::Char('b') => self.export_snapshot_backup(),
             KeyCode::Char('s') => self.save_changes_to_registry(),
-            KeyCode::Char('E') => match relaunch_elevated() {
-                Ok(()) => self.should_quit = true,
-                Err(err) => self.log(LogLevel::Err, format!("elevation failed: {err}")),
-            },
+            KeyCode::Char('E') => self.elevate_session(),
             KeyCode::Char('?') => self.modal = Modal::Help,
             _ => {}
         }
     }
 
-    fn on_filter_key(&mut self, key: KeyCode, mut buffer: String) {
+    fn on_filter_key(&mut self, key: KeyCode, mut buffer: String, original_query: String) {
         match key {
-            KeyCode::Esc => {}
+            KeyCode::Esc => {
+                self.filter_query = original_query;
+                self.clamp_entry_selection();
+                self.log(LogLevel::Info, "search filter edit canceled");
+            }
             KeyCode::Enter => {
                 self.filter_query = buffer.trim().to_string();
                 self.clamp_entry_selection();
@@ -763,16 +1160,25 @@ impl App {
                 buffer.pop();
                 self.filter_query = buffer.trim().to_string();
                 self.clamp_entry_selection();
-                self.modal = Modal::Filter { buffer };
+                self.modal = Modal::Filter {
+                    buffer,
+                    original_query,
+                };
             }
             KeyCode::Char(c) => {
                 buffer.push(c);
                 self.filter_query = buffer.trim().to_string();
                 self.clamp_entry_selection();
-                self.modal = Modal::Filter { buffer };
+                self.modal = Modal::Filter {
+                    buffer,
+                    original_query,
+                };
             }
             _ => {
-                self.modal = Modal::Filter { buffer };
+                self.modal = Modal::Filter {
+                    buffer,
+                    original_query,
+                };
             }
         }
     }
@@ -812,16 +1218,21 @@ impl App {
     }
 }
 
-/// Checks whether `haystack` contains `needle` using ASCII case-insensitive comparison
-/// without heap-allocating lowercased copies.
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+/// Checks whether `haystack` contains `needle` case-insensitively.
+///
+/// Uses a zero-allocation byte window scan when both strings are pure ASCII and falls back
+/// to full Unicode `.to_lowercase()` folding when either string contains non-ASCII characters.
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    if haystack.is_ascii() && needle.is_ascii() {
+        return haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()));
+    }
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 fn extract_path_list(vars: &[EnvVariable]) -> Vec<String> {
@@ -862,23 +1273,23 @@ mod tests {
 
     fn sample_vars() -> (Vec<EnvVariable>, Vec<EnvVariable>) {
         let temp = std::env::temp_dir().to_string_lossy().to_string();
-        let user = vec![EnvVariable {
-            name: "Path".to_string(),
-            value: format!(r"{temp};C:\__missing_dir_lazypath__"),
-            scope: EnvScope::User,
-            modified: false,
-        }];
-        let sys = vec![EnvVariable {
-            name: "Path".to_string(),
-            value: temp,
-            scope: EnvScope::System,
-            modified: false,
-        }];
+        let user = vec![EnvVariable::with_kind(
+            "Path",
+            format!(r"{temp};C:\__missing_dir_lazypath__"),
+            EnvScope::User,
+            RegValueKind::ExpandSz,
+        )];
+        let sys = vec![EnvVariable::with_kind(
+            "Path",
+            temp,
+            EnvScope::System,
+            RegValueKind::ExpandSz,
+        )];
         (user, sys)
     }
 
     #[test]
-    fn handles_add_entry_and_filter_modals_via_keys() {
+    fn handles_add_entry_and_filter_modals_including_esc_revert() {
         let (u, s) = sample_vars();
         let mut app = App::new(u, s, false);
         app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
@@ -888,11 +1299,60 @@ mod tests {
         app.on_key(KeyCode::Char('T'), KeyModifiers::NONE);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.user_path_raw.len(), 3);
+
+        // Apply filter via Enter
         app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('m'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
         app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.filter_query, "mis");
         assert_eq!(app.visible_entries().len(), 1);
+
+        // Re-open filter, type extra chars, then press Esc -> reverts to "mis"
+        app.on_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(app.filter_query, "miszz");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.filter_query, "mis");
+    }
+
+    #[test]
+    fn prompts_before_quitting_with_unsaved_changes() {
+        let (u, s) = sample_vars();
+        let mut app = App::new(u, s, false);
+        app.add_path_entry(r"C:\NewTools;C:\OtherTools");
+        assert_eq!(app.user_path_raw.len(), 4);
+        assert!(app.has_unsaved_changes());
+
+        // Pressing 'q' opens ConfirmQuit instead of exiting immediately
+        app.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        assert_eq!(app.modal, Modal::ConfirmQuit);
+
+        // Pressing 'n' cancels quit
+        app.on_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.should_quit);
+        assert_eq!(app.modal, Modal::None);
+
+        // Pressing 'q' then 'y' confirms quit
+        app.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn blocks_prune_when_filter_is_active_and_supports_unicode_search() {
+        let (u, s) = sample_vars();
+        let mut app = App::new(u, s, false);
+        app.add_path_entry(r"C:\Пользователи\Аня\bin");
+        app.filter_query = "аня".to_string();
+        assert_eq!(app.visible_entries().len(), 1);
+
+        let len_before = app.user_path_raw.len();
+        app.prune_invalid_entries();
+        assert_eq!(app.user_path_raw.len(), len_before);
+        assert_eq!(app.status_log.level, LogLevel::Warn);
     }
 }
