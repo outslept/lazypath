@@ -291,30 +291,25 @@ mod win32 {
 
     use crate::model::{EnvScope, EnvVariable, RegValueKind};
 
-    type HKEY = isize;
-    type HANDLE = isize;
-    type HWND = isize;
-    type BOOL = i32;
+    type Hkey = isize;
+    type Handle = isize;
+    type Hwnd = isize;
+    type Bool = i32;
 
-    const HKEY_CURRENT_USER: HKEY = 0x8000_0001_u32 as i32 as isize;
-    const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002_u32 as i32 as isize;
-
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001_u32 as i32 as isize;
+    const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002_u32 as i32 as isize;
     const KEY_QUERY_VALUE: u32 = 0x0001;
     const KEY_SET_VALUE: u32 = 0x0002;
     const KEY_WOW64_64KEY: u32 = 0x0100;
-
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
-
     const ERROR_SUCCESS: u32 = 0;
     const ERROR_FILE_NOT_FOUND: u32 = 2;
     const ERROR_MORE_DATA: u32 = 234;
     const ERROR_NO_MORE_ITEMS: u32 = 259;
-
     const TOKEN_QUERY: u32 = 0x0008;
     const TOKEN_ELEVATION_CLASS: u32 = 20;
-
-    const HWND_BROADCAST: HWND = 0xffff;
+    const HWND_BROADCAST: Hwnd = 0xffff;
     const WM_SETTINGCHANGE: u32 = 0x001A;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
     const SW_SHOWNORMAL: i32 = 1;
@@ -327,15 +322,15 @@ mod win32 {
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn RegOpenKeyExW(
-            hKey: HKEY,
+            hKey: Hkey,
             lpSubKey: *const u16,
             ulOptions: u32,
             samDesired: u32,
-            phkResult: *mut HKEY,
+            phkResult: *mut Hkey,
         ) -> u32;
-        fn RegCloseKey(hKey: HKEY) -> u32;
+        fn RegCloseKey(hKey: Hkey) -> u32;
         fn RegQueryInfoKeyW(
-            hKey: HKEY,
+            hKey: Hkey,
             lpClass: *mut u16,
             lpcchClass: *mut u32,
             lpReserved: *const u32,
@@ -349,7 +344,7 @@ mod win32 {
             lpftLastWriteTime: *mut u64,
         ) -> u32;
         fn RegEnumValueW(
-            hKey: HKEY,
+            hKey: Hkey,
             dwIndex: u32,
             lpValueName: *mut u16,
             lpcchValueName: *mut u32,
@@ -359,38 +354,38 @@ mod win32 {
             lpcbData: *mut u32,
         ) -> u32;
         fn RegSetValueExW(
-            hKey: HKEY,
+            hKey: Hkey,
             lpValueName: *const u16,
             Reserved: u32,
             dwType: u32,
             lpData: *const u8,
             cbData: u32,
         ) -> u32;
-        fn RegDeleteValueW(hKey: HKEY, lpValueName: *const u16) -> u32;
+        fn RegDeleteValueW(hKey: Hkey, lpValueName: *const u16) -> u32;
         fn OpenProcessToken(
-            ProcessHandle: HANDLE,
+            ProcessHandle: Handle,
             DesiredAccess: u32,
-            TokenHandle: *mut HANDLE,
-        ) -> BOOL;
+            TokenHandle: *mut Handle,
+        ) -> Bool;
         fn GetTokenInformation(
-            TokenHandle: HANDLE,
+            TokenHandle: Handle,
             TokenInformationClass: u32,
             TokenInformation: *mut core::ffi::c_void,
             TokenInformationLength: u32,
             ReturnLength: *mut u32,
-        ) -> BOOL;
+        ) -> Bool;
     }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn GetCurrentProcess() -> HANDLE;
-        fn CloseHandle(hObject: HANDLE) -> BOOL;
+        fn GetCurrentProcess() -> Handle;
+        fn CloseHandle(hObject: Handle) -> Bool;
     }
 
     #[link(name = "user32")]
     unsafe extern "system" {
         fn SendMessageTimeoutW(
-            hWnd: HWND,
+            hWnd: Hwnd,
             Msg: u32,
             wParam: usize,
             lParam: *const u16,
@@ -403,7 +398,7 @@ mod win32 {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteW(
-            hwnd: HWND,
+            hwnd: Hwnd,
             lpOperation: *const u16,
             lpFile: *const u16,
             lpParameters: *const u16,
@@ -412,7 +407,7 @@ mod win32 {
         ) -> isize;
     }
 
-    struct RegKeyGuard(HKEY);
+    struct RegKeyGuard(Hkey);
 
     impl Drop for RegKeyGuard {
         fn drop(&mut self) {
@@ -437,7 +432,7 @@ mod win32 {
             .collect()
     }
 
-    const fn hive_for_scope(scope: EnvScope) -> HKEY {
+    const fn hive_for_scope(scope: EnvScope) -> Hkey {
         match scope {
             EnvScope::User => HKEY_CURRENT_USER,
             EnvScope::System => HKEY_LOCAL_MACHINE,
@@ -446,7 +441,7 @@ mod win32 {
 
     fn open_env_key(scope: EnvScope, access: u32) -> Result<RegKeyGuard> {
         let subkey = to_wide_null(scope.registry_subkey());
-        let mut hkey: HKEY = 0;
+        let mut hkey: Hkey = 0;
         // SAFETY: `subkey` is a valid NUL-terminated UTF-16 buffer and `hkey` is a valid out-pointer.
         let status = unsafe {
             RegOpenKeyExW(
@@ -650,7 +645,7 @@ mod win32 {
     }
 
     pub(super) fn is_process_elevated() -> bool {
-        let mut token: HANDLE = 0;
+        let mut token: Handle = 0;
         // SAFETY: `GetCurrentProcess()` returns a pseudo-handle valid for the lifetime of the process.
         let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) };
         if opened == 0 || token == 0 {
