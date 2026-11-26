@@ -4,3 +4,9 @@ check-all = "check --all-targets"
 
 [term]
 color = "auto"
+
+[env]
+RUST_BACKTRACE = "1"
+
+[resolver]
+incompatible-rust-versions = "fallback"
