@@ -506,18 +506,11 @@ mod tests {
         assert!(!reg_entries[1].exists);
 
         let custom_proc_path = format!(r"{temp_dir};C:\__lazypath_proc_only__");
-        let proc_entries = collect_combined_path_entries(
-            &user_vars,
-            &sys_vars,
-            Some(&custom_path_ref(&custom_proc_path)),
-        );
+        let proc_entries =
+            collect_combined_path_entries(&user_vars, &sys_vars, Some(&custom_proc_path));
         assert_eq!(proc_entries.len(), 2);
         assert_eq!(proc_entries[0].scope, EnvScope::System);
         assert_eq!(proc_entries[1].scope, EnvScope::User);
-    }
-
-    fn custom_path_ref(s: &str) -> &str {
-        s
     }
 
     #[test]
