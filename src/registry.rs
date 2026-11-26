@@ -1,7 +1,7 @@
-use anyhow::{bail, Context, Result};
-
 use crate::expand::expand_env_vars;
 use crate::model::{validate_variable_name, EnvScope, EnvVariable, RegValueKind};
+use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 
 /// Registry value type token for strings containing `%VAR%` environment references.
 const REG_EXPAND_SZ_TOKEN: &str = "REG_EXPAND_SZ";
