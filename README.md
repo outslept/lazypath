@@ -1,3 +1,5 @@
+<img src=".github/banner.jpg" />
+
 # lazypath
 
 Minimalist TUI and CLI Windows `PATH` and environment variable auditor.
