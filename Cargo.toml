@@ -1,6 +1,6 @@
 [package]
 name = "lazypath"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Minimalist TUI and CLI Windows PATH and environment variable auditor"
 license = "MIT"
